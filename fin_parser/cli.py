@@ -77,25 +77,14 @@ def cmd_value(args: argparse.Namespace) -> None:
     from fin_parser.db import get_connection
 
     # Load most recent filing metrics from DB
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT id, company, period FROM filings WHERE cik LIKE ? ORDER BY filed_date DESC LIMIT 1",
-        (f"%{args.ticker.upper()}%",)
-    ).fetchone()
+    row = _get_latest_filing_for_ticker(args.ticker)
 
     if not row:
-        # Try by company name
-        row = conn.execute(
-            "SELECT id, company, period FROM filings ORDER BY filed_date DESC LIMIT 1"
-        ).fetchone()
-
-    if not row:
-        print("No filings found in DB. Run 'fin-parser extract' first.")
+        print(f"No filings found for '{args.ticker}' in DB. Run 'fin-parser extract {args.ticker}' first.")
         return
 
     filing_id, company, period = row["id"], row["company"], row["period"]
     raw_metrics = get_metrics(filing_id)
-    conn.close()
 
     metrics = {r["metric"]: r["value"] for r in raw_metrics}
     print(f"\nValuing {company} ({period})")
@@ -177,16 +166,38 @@ def cmd_value(args: argparse.Namespace) -> None:
     print(f"\nValuation saved to DB.")
 
 
+def _get_latest_filing_for_ticker(ticker: str):
+    """Look up the most recent filing for a ticker by matching company name or CIK."""
+    from fin_parser.db import get_connection
+    from fin_parser.ingestion.edgar import ticker_to_cik
+    conn = get_connection()
+    # Try by CIK first (most reliable)
+    try:
+        cik = ticker_to_cik(ticker)
+        row = conn.execute(
+            "SELECT id, company, period FROM filings WHERE cik = ? ORDER BY filed_date DESC LIMIT 1",
+            (cik,)
+        ).fetchone()
+        if row:
+            conn.close()
+            return row
+    except Exception:
+        pass
+    # Fallback: match company name
+    row = conn.execute(
+        "SELECT id, company, period FROM filings WHERE company LIKE ? ORDER BY filed_date DESC LIMIT 1",
+        (f"%{ticker.upper()}%",)
+    ).fetchone()
+    conn.close()
+    return row
+
+
 def cmd_redflag(args: argparse.Namespace) -> None:
     from fin_parser.analysis.red_flags import analyze_red_flags
     from fin_parser.ingestion.repository import get_metrics
-    from fin_parser.db import get_connection
 
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT id, company, period FROM filings ORDER BY filed_date DESC LIMIT 1"
-    ).fetchone()
-    conn.close()
+    row = _get_latest_filing_for_ticker(args.ticker)
+    conn = None
 
     if not row:
         print("No filings found in DB. Run 'fin-parser extract' first.")
