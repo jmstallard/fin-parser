@@ -1,0 +1,27 @@
+from __future__ import annotations
+import argparse
+import sys
+
+def cmd_fetch(args: argparse.Namespace) -> None:
+    from fin_parser.ingestion.edgar import get_filings, ticker_to_cik
+    print(f"Resolving ticker '{args.ticker}' → CIK...")
+    cik = ticker_to_cik(args.ticker)
+    print(f"CIK: {cik}")
+    print(f"Fetching last {args.limit} {args.form} filings...")
+    filings = get_filings(cik, form_type=args.form, limit=args.limit)
+    for f in filings:
+        print(f"  {f['filed_date']}  {f['form_type']}  period={f['period']}  accession={f['accession']}")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="fin-parser")
+    sub = parser.add_subparsers(dest="command", required=True)
+    fetch_p = sub.add_parser("fetch")
+    fetch_p.add_argument("ticker")
+    fetch_p.add_argument("--form", default="10-K")
+    fetch_p.add_argument("--limit", type=int, default=3)
+    fetch_p.set_defaults(func=cmd_fetch)
+    args = parser.parse_args()
+    args.func(args)
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,164 @@
+"""
+fin_parser/ingestion/edgar.py
+Fetch filing metadata and documents from the SEC EDGAR REST API.
+
+EDGAR endpoints used:
+  - /submissions/{cik}.json   -> filing history for a company
+  - /Archives/edgar/...       -> actual filing documents
+
+SEC rate limit: ~10 req/s. We enforce a small sleep between calls.
+"""
+from __future__ import annotations
+
+import time
+from pathlib import Path
+from typing import Any
+
+import requests
+
+from fin_parser.config import (
+    EDGAR_BASE_URL,
+    EDGAR_RATE_LIMIT_DELAY,
+    EDGAR_USER_AGENT,
+    RAW_DIR,
+)
+
+
+# HTTP session
+
+def _session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({"User-Agent": EDGAR_USER_AGENT, "Accept-Encoding": "gzip"})
+    return s
+
+
+SESSION = _session()
+
+
+def _get(url: str) -> dict[str, Any]:
+    """GET JSON from EDGAR, respecting rate limit."""
+    time.sleep(EDGAR_RATE_LIMIT_DELAY)
+    resp = SESSION.get(url, timeout=30)
+    resp.raise_for_status()
+    return resp.json()  # type: ignore[no-any-return]
+
+
+# CIK helpers
+
+def ticker_to_cik(ticker: str) -> str:
+    """Resolve a ticker symbol to a zero-padded 10-digit CIK."""
+    data = _get("https://www.sec.gov/files/company_tickers.json")
+    ticker_upper = ticker.upper()
+    for entry in data.values():
+        if entry.get("ticker", "").upper() == ticker_upper:
+            return str(entry["cik_str"]).zfill(10)
+    raise ValueError(f"Ticker '{ticker}' not found in EDGAR.")
+
+
+# Filing search
+
+def get_filings(
+    cik: str,
+    form_type: str = "10-K",
+    limit: int = 5,
+) -> list[dict[str, Any]]:
+    """Return the most recent `limit` filings of `form_type` for a given CIK."""
+    cik_padded = cik.zfill(10)
+    data = _get(f"{EDGAR_BASE_URL}/submissions/CIK{cik_padded}.json")
+
+    company_name: str = data.get("name", "Unknown")
+    recent = data.get("filings", {}).get("recent", {})
+
+    forms      = recent.get("form", [])
+    accessions = recent.get("accessionNumber", [])
+    dates      = recent.get("filingDate", [])
+    periods    = recent.get("reportDate", [])
+
+    results = []
+    for form, accession, date, period in zip(forms, accessions, dates, periods):
+        if form == form_type:
+            acc_clean = accession.replace("-", "")
+            results.append({
+                "cik": cik_padded,
+                "company": company_name,
+                "form_type": form,
+                "accession": accession,
+                "filed_date": date,
+                "period": period,
+                "accession_clean": acc_clean,
+            })
+            if len(results) >= limit:
+                break
+
+    return results
+
+
+def _quarter(date_str: str) -> str:
+    month = int(date_str[5:7])
+    return f"QTR{(month - 1) // 3 + 1}"
+
+
+# Document download
+
+def get_filing_document_url(accession_clean: str, cik_padded: str) -> str | None:
+    """
+    Find the primary document URL using EDGAR's index JSON.
+    Falls back to scanning all docs if sequence 1 is not an HTM.
+    """
+    cik_int = int(cik_padded)
+    base = f"https://www.sec.gov/Archives/edgar/data/{cik_int}/{accession_clean}"
+    index_url = f"{base}/{accession_clean}-index.json"
+
+    try:
+        time.sleep(EDGAR_RATE_LIMIT_DELAY)
+        resp = SESSION.get(index_url, timeout=30)
+        resp.raise_for_status()
+        index = resp.json()
+    except Exception as e:
+        print(f"  Could not fetch index JSON: {e}")
+        return None
+
+    documents = index.get("documents", [])
+
+    # First pass: sequence "1" HTM file
+    for doc in documents:
+        if str(doc.get("sequence", "")) == "1":
+            name = doc.get("filename", "")
+            if name.lower().endswith((".htm", ".html")):
+                return f"{base}/{name}"
+
+    # Second pass: any HTM that isn't XBRL
+    for doc in documents:
+        name = doc.get("filename", "")
+        doc_type = doc.get("type", "")
+        if name.lower().endswith((".htm", ".html")) and doc_type not in ("XML", "XBRL"):
+            return f"{base}/{name}"
+
+    return None
+
+
+def download_filing(filing: dict[str, Any]) -> Path:
+    """
+    Download the primary HTM document for a filing to RAW_DIR.
+    Returns the local path.
+    """
+    cik = filing["cik"]
+    acc = filing["accession_clean"]
+    local_path = RAW_DIR / f"{cik}_{acc}.htm"
+
+    if local_path.exists():
+        print(f"  [cache hit] {local_path.name}")
+        return local_path
+
+    doc_url = get_filing_document_url(acc, cik)
+    if doc_url is None:
+        raise RuntimeError(f"Could not find primary document for accession {acc}")
+
+    print(f"  Downloading {doc_url}")
+    time.sleep(EDGAR_RATE_LIMIT_DELAY)
+    resp = SESSION.get(doc_url, timeout=60)
+    resp.raise_for_status()
+
+    local_path.write_bytes(resp.content)
+    print(f"  Saved -> {local_path}")
+    return local_path

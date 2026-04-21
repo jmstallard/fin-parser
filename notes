@@ -1,0 +1,11 @@
+Unfortunately no — my memory and this sandbox reset between sessions. But your code on your machine is safe!
+To pick up seamlessly tomorrow, just start a new chat and paste something like:
+
+"I'm building fin-parser — an AI-powered EDGAR filing parser in Python. Here's where we left off..."
+
+Then share either:
+
+The contents of your key files (edgar.py, db.py, cli.py, config.py)
+Or just describe where we got to: fetch works, DB is initialized, next step is saving filings to DB and downloading documents
+
+That'll get me back up to speed instantly. See you tomorrow! 🚀
