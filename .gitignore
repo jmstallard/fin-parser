@@ -1,0 +1,5 @@
+.env
+data/raw/*.htm
+data/fin_parser.db
+.venv/
+*.egg-info/
