@@ -15,20 +15,10 @@ from fin_parser.config import ANTHROPIC_API_KEY, CLAUDE_MODEL
 
 CLIENT = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
-# Metrics we want Claude to extract
 METRICS_TO_EXTRACT = [
-    "revenue",
-    "net_income",
-    "eps_basic",
-    "eps_diluted",
-    "free_cash_flow",
-    "operating_cash_flow",
-    "shares_outstanding",
-    "shares_diluted",
-    "total_debt",
-    "cash_and_equivalents",
-    "goodwill",
-    "capex",
+    "revenue", "net_income", "eps_basic", "eps_diluted",
+    "free_cash_flow", "operating_cash_flow", "shares_outstanding",
+    "shares_diluted", "total_debt", "cash_and_equivalents", "goodwill", "capex",
 ]
 
 SYSTEM_PROMPT = """
@@ -91,7 +81,7 @@ OUTPUT FORMAT (return exactly this structure):
 def extract_text_from_htm(path: Path) -> str:
     """
     Strip HTML tags from a filing and return plain text.
-    Focuses on the financial statements section.
+    Preserves table structure by inserting tabs/newlines around cells.
     """
     raw = path.read_text(encoding="utf-8", errors="ignore")
 
@@ -99,25 +89,41 @@ def extract_text_from_htm(path: Path) -> str:
     raw = re.sub(r"<script[^>]*>.*?</script>", " ", raw, flags=re.DOTALL | re.IGNORECASE)
     raw = re.sub(r"<style[^>]*>.*?</style>", " ", raw, flags=re.DOTALL | re.IGNORECASE)
 
-    # Remove all HTML tags
-    text = re.sub(r"<[^>]+>", " ", raw)
+    # Preserve table structure
+    raw = re.sub(r"<tr[^>]*>", "\n", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"</tr>", "\n", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"<td[^>]*>|<th[^>]*>", "\t", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"</td>|</th>", "", raw, flags=re.IGNORECASE)
 
-    # Collapse whitespace
+    # Preserve paragraph/block breaks
+    raw = re.sub(r"<br[^>]*>", "\n", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"</p>|</div>|</h[1-6]>", "\n", raw, flags=re.IGNORECASE)
+
+    # Remove remaining tags
+    text = re.sub(r"<[^>]+>", "", raw)
+
+    # Decode common HTML entities
+    text = text.replace("&#8220;", '"').replace("&#8221;", '"')
+    text = text.replace("&#8217;", "'").replace("&#8216;", "'")
+    text = text.replace("&amp;", "&").replace("&nbsp;", " ")
+    text = text.replace("&#160;", " ").replace("&lt;", "<").replace("&gt;", ">")
+
+    # Collapse excessive whitespace but preserve newlines
     text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
 
     return text.strip()
 
 
 def find_financial_section(text: str) -> str:
     """
-    Isolate the financial statements section from the full filing text.
-    Skips the table of contents by finding the SECOND occurrence of key markers,
-    or by looking past the first 20% of the document.
+    Isolate the actual financial statements — skips TOC, risk factors,
+    and the auditor report by finding the first real data table after
+    the section heading.
     """
     text_upper = text.upper()
-    # Skip the first 20% of the doc (TOC + boilerplate)
-    search_start = len(text) // 5
+    # Risk factors and TOC are in the first ~40% — skip them
+    search_start = int(len(text) * 0.40)
 
     markers = [
         "CONSOLIDATED STATEMENTS OF OPERATIONS",
@@ -125,6 +131,7 @@ def find_financial_section(text: str) -> str:
         "CONSOLIDATED BALANCE SHEET",
         "CONSOLIDATED STATEMENTS OF COMPREHENSIVE INCOME",
         "NOTES TO CONSOLIDATED FINANCIAL STATEMENTS",
+        "F-1",
     ]
 
     best_pos = len(text)
@@ -133,11 +140,27 @@ def find_financial_section(text: str) -> str:
         if 0 < pos < best_pos:
             best_pos = pos
 
-    if best_pos < len(text):
-        return text[best_pos: best_pos + 120_000]
+    if best_pos >= len(text):
+        return text[int(len(text) * 0.60):]
 
-    # Fallback: second half of document
-    return text[len(text) // 2:]
+    # We found the section heading — now skip past auditor report / mini-TOC
+    # by finding the first line that contains an actual dollar amount or number
+    # within 50k chars of the heading
+    candidate = text[best_pos: best_pos + 50_000]
+    lines = candidate.split("\n")
+    data_start_offset = 0
+    seen_years = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        # Look for a year header like "2025 2024 2023"
+        if re.search(r"20\d\d\s+20\d\d", stripped):
+            seen_years = True
+        # After seeing years, find first line with a dollar amount
+        if seen_years and re.search(r"\$\s*[\d,]+|	\s*[\d,]+", stripped):
+            data_start_offset = sum(len(l) + 1 for l in lines[:i])
+            break
+
+    return text[best_pos + data_start_offset: best_pos + data_start_offset + 120_000]
 
 
 def chunk_text(text: str, chunk_size: int = 12_000, overlap: int = 500) -> list[str]:
@@ -160,19 +183,13 @@ def extract_metrics_from_chunk(chunk: str) -> dict[str, Any]:
         messages=[{"role": "user", "content": chunk}],
     )
     raw = response.content[0].text.strip()
-
-    # Strip markdown fences if Claude added them
     raw = re.sub(r"^```json\s*", "", raw)
     raw = re.sub(r"\s*```$", "", raw)
-
     return json.loads(raw)
 
 
 def merge_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
-    """
-    Merge metrics across chunks — take the first non-null value for each metric.
-    This handles cases where different metrics appear in different sections.
-    """
+    """Merge metrics across chunks — take first non-null value for each metric."""
     merged: dict[str, Any] = {m: None for m in METRICS_TO_EXTRACT}
     for result in results:
         for metric in METRICS_TO_EXTRACT:
@@ -181,11 +198,22 @@ def merge_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     return merged
 
 
+def detect_reporting_unit(text: str) -> str:
+    """
+    Detect whether the filing reports in thousands or millions.
+    Returns a hint string to prepend to each chunk.
+    """
+    sample = text[:5000].lower()
+    if "in thousands" in sample or "expressed in thousands" in sample:
+        return "NOTE: This filing reports monetary values in THOUSANDS of USD. Divide all monetary values by 1000 to convert to millions before returning."
+    if "in millions" in sample or "expressed in millions" in sample:
+        return "NOTE: This filing reports monetary values in MILLIONS of USD. No conversion needed."
+    return "NOTE: Determine the reporting unit from context (look for 'in thousands' or 'in millions' near the financial statements). Convert all monetary values to millions of USD."
+
+
 def extract_metrics(filing_path: Path, period: str) -> dict[str, Any]:
     """
     Full pipeline: HTM file -> text -> chunks -> Claude -> merged metrics.
-
-    Returns a dict of metric -> value (None if not found).
     """
     print(f"  Extracting text from {filing_path.name}...")
     full_text = extract_text_from_htm(filing_path)
@@ -194,6 +222,10 @@ def extract_metrics(filing_path: Path, period: str) -> dict[str, Any]:
     financial_section = find_financial_section(full_text)
     print(f"  Financial section: {len(financial_section):,} chars")
 
+    # Detect reporting unit and prepend hint to every chunk
+    unit_hint = detect_reporting_unit(financial_section)
+    print(f"  Units: {unit_hint[:60]}...")
+
     chunks = chunk_text(financial_section)
     print(f"  Sending {len(chunks)} chunk(s) to Claude...")
 
@@ -201,9 +233,10 @@ def extract_metrics(filing_path: Path, period: str) -> dict[str, Any]:
     for i, chunk in enumerate(chunks):
         print(f"    Chunk {i + 1}/{len(chunks)}...", end=" ", flush=True)
         try:
-            metrics = extract_metrics_from_chunk(chunk)
+            # Prepend unit hint so Claude always knows how to scale
+            annotated_chunk = f"{unit_hint}\n\n{chunk}"
+            metrics = extract_metrics_from_chunk(annotated_chunk)
             results.append(metrics)
-            # Stop early if we already have all metrics
             merged_so_far = merge_metrics(results)
             found = sum(1 for v in merged_so_far.values() if v is not None)
             print(f"{found}/{len(METRICS_TO_EXTRACT)} metrics found")
