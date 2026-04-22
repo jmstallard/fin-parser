@@ -17,17 +17,27 @@ from fin_parser.config import DB_PATH
 DDL = """
 -- Phase 1: raw filing metadata
 CREATE TABLE IF NOT EXISTS filings (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    cik         TEXT    NOT NULL,
-    ticker      TEXT,
-    company     TEXT    NOT NULL,
-    form_type   TEXT    NOT NULL,   -- '10-K', '10-Q', etc.
-    period      TEXT    NOT NULL,   -- '2023-12-31'
-    filed_date  TEXT    NOT NULL,
-    accession   TEXT    NOT NULL UNIQUE,
-    raw_path    TEXT,               -- local path to downloaded file
-    fetched_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    cik           TEXT    NOT NULL,
+    ticker        TEXT,
+    company       TEXT    NOT NULL,
+    form_type     TEXT    NOT NULL,   -- '10-K', '10-Q', 'NI 43-101', 'PEA', 'FS', etc.
+    period        TEXT    NOT NULL,   -- '2023-12-31'
+    filed_date    TEXT    NOT NULL,
+    accession     TEXT    NOT NULL UNIQUE,
+    raw_path      TEXT,               -- local path to downloaded file
+    jurisdiction  TEXT    NOT NULL DEFAULT 'US',    -- 'US' | 'CA'
+    source        TEXT    NOT NULL DEFAULT 'EDGAR', -- 'EDGAR' | 'SEDAR+' | 'UPLOAD'
+    -- Optional asset/mine name. Set only for per-project NI 43-101 / PEA /
+    -- PFS / FS reports so a single issuer can carry multiple technical
+    -- reports (e.g. Agnico Eagle's 'Detour Lake' + 'Hope Bay') without
+    -- collapsing in the dashboard. NULL for corporate filings.
+    project       TEXT,
+    fetched_at    TEXT    NOT NULL DEFAULT (datetime('now'))
 );
+-- NOTE: indexes on jurisdiction/source are created in _apply_migrations so
+-- they can safely run after the columns are added to pre-existing DBs.
+CREATE INDEX IF NOT EXISTS idx_filings_form_type ON filings(form_type);
 
 -- Phase 1: extracted financial metrics
 CREATE TABLE IF NOT EXISTS metrics (
@@ -41,6 +51,22 @@ CREATE TABLE IF NOT EXISTS metrics (
 );
 CREATE INDEX IF NOT EXISTS idx_metrics_filing ON metrics(filing_id);
 CREATE INDEX IF NOT EXISTS idx_metrics_metric  ON metrics(metric);
+
+-- Mining-specific technical metrics from NI 43-101 / PEA / PFS / FS reports.
+-- Kept in a separate table because units vary widely (t, Mt, g/t, USD/oz, years, %).
+CREATE TABLE IF NOT EXISTS mining_metrics (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    filing_id    INTEGER NOT NULL REFERENCES filings(id) ON DELETE CASCADE,
+    metric       TEXT    NOT NULL,   -- 'npv_after_tax', 'irr', 'aisc', 'mine_life', ...
+    value        REAL,
+    unit         TEXT,               -- 'USD_M', 'percent', 'years', 'g_per_tonne', 'Mt', 'USD_per_oz', ...
+    commodity    TEXT,               -- 'gold', 'copper', 'silver', 'lithium', ...
+    category     TEXT,               -- 'economics', 'reserves', 'resources', 'operating', 'geology'
+    period       TEXT    NOT NULL,
+    extracted_at TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_mining_metrics_filing ON mining_metrics(filing_id);
+CREATE INDEX IF NOT EXISTS idx_mining_metrics_metric ON mining_metrics(metric);
 
 -- Phase 2: red flags surfaced by the analysis agent
 CREATE TABLE IF NOT EXISTS red_flags (
@@ -88,10 +114,35 @@ def transaction(db_path: Path = DB_PATH) -> Generator[sqlite3.Connection, None, 
         conn.close()
 
 
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """
+    Lightweight migrations for pre-existing databases that were created before
+    later columns were added. Each block is idempotent.
+
+    IMPORTANT: runs AFTER the main DDL so CREATE TABLE IF NOT EXISTS won't
+    trip on missing columns. Indexes that depend on added columns live here
+    (not in DDL) so they can't fire before their column exists.
+    """
+    existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(filings)").fetchall()}
+    if "jurisdiction" not in existing_cols:
+        conn.execute("ALTER TABLE filings ADD COLUMN jurisdiction TEXT NOT NULL DEFAULT 'US'")
+    if "source" not in existing_cols:
+        conn.execute("ALTER TABLE filings ADD COLUMN source TEXT NOT NULL DEFAULT 'EDGAR'")
+    if "project" not in existing_cols:
+        # Nullable — existing rows stay NULL, corporate filings stay NULL,
+        # only per-project technical reports get a value.
+        conn.execute("ALTER TABLE filings ADD COLUMN project TEXT")
+    # Indexes on potentially-just-added columns
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_filings_jurisdiction ON filings(jurisdiction)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_filings_source       ON filings(source)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_filings_project      ON filings(project)")
+
+
 def init_db(db_path: Path = DB_PATH) -> None:
     """Create all tables. Safe to call multiple times (IF NOT EXISTS)."""
     with transaction(db_path) as conn:
         conn.executescript(DDL)
+        _apply_migrations(conn)
     print(f"Database ready: {db_path}")
 
 

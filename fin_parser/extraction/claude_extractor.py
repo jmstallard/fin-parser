@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import anthropic
+import pdfplumber
 
 from fin_parser.config import ANTHROPIC_API_KEY, CLAUDE_MODEL
 
@@ -198,22 +199,231 @@ def merge_metrics(results: list[dict[str, Any]]) -> dict[str, Any]:
     return merged
 
 
-def detect_reporting_unit(text: str) -> str:
-    """
-    Detect whether the filing reports in thousands or millions.
-    Returns a hint string to prepend to each chunk.
-    """
-    sample = text[:5000].lower()
-    if "in thousands" in sample or "expressed in thousands" in sample:
-        return "NOTE: This filing reports monetary values in THOUSANDS of USD. Divide all monetary values by 1000 to convert to millions before returning."
-    if "in millions" in sample or "expressed in millions" in sample:
-        return "NOTE: This filing reports monetary values in MILLIONS of USD. No conversion needed."
-    return "NOTE: Determine the reporting unit from context (look for 'in thousands' or 'in millions' near the financial statements). Convert all monetary values to millions of USD."
+# Patterns used to detect reporting-unit declarations. They live at module
+# scope so `detect_reporting_unit` stays cheap to call and so tests can
+# inspect them. Each list is a set of regex fragments that will match after
+# whitespace has been stripped from the input — pdfplumber frequently
+# collapses spaces in PDF table headers (e.g. "(thousandsofUnitedStatesdollars)"
+# rather than "(thousands of United States dollars)"), so matching against a
+# compacted copy of the text is far more reliable than the original.
+_THOUSANDS_MARKERS = [
+    r"\(inthousands\)",
+    r"amountsinthousands",
+    r"inthousandsof(unitedstates|u\.?s\.?|canadian|c\$|us\$)?dollars",
+    r"\(thousandsofunitedstatesdollars",
+    r"\(thousandsofcanadiandollars",
+    r"\(thousandsofusdollars",
+    r"\(thousandsofu\.s\.dollars",
+    r"expressedinthousands",
+]
+_MILLIONS_MARKERS = [
+    r"\(inmillions\)",
+    r"amountsinmillions",
+    r"inmillionsof(unitedstates|u\.?s\.?|canadian|c\$|us\$)?dollars",
+    r"\(millionsofunitedstatesdollars",
+    r"\(millionsofcanadiandollars",
+    r"\(millionsofusdollars",
+    r"\(millionsofu\.s\.dollars",
+    r"expressedinmillions",
+]
 
 
-def extract_metrics(filing_path: Path, period: str) -> dict[str, Any]:
+def detect_reporting_unit(text: str, override: str | None = None) -> str:
+    """
+    Decide whether monetary values in the filing are reported in thousands
+    or millions, and return a hint string that gets prepended to every
+    chunk sent to Claude.
+
+    Scans the WHOLE document (not just the first 5k chars) because
+    Canadian IFRS interim reports declare units in the repeated table
+    headers rather than the cover page, and those headers often appear
+    80k+ characters into the PDF. Matches are counted; the higher count
+    wins. Ties fall through to an 'ambiguous' hint that asks Claude to
+    decide per-table.
+
+    Args:
+        text:     full document text
+        override: optional 'thousands' | 'millions' — bypasses detection
+                  entirely. Exposed as a CLI escape hatch for the rare
+                  filing whose unit declaration the regex misses.
+    """
+    if override:
+        o = override.strip().lower()
+        if o in {"thousands", "thousand", "k", "000s"}:
+            return (
+                "NOTE: The user explicitly declared this filing reports monetary "
+                "values in THOUSANDS of USD. Divide all monetary values from "
+                "tables by 1000 to convert to millions before returning."
+            )
+        if o in {"millions", "million", "m", "mm", "000000s"}:
+            return (
+                "NOTE: The user explicitly declared this filing reports "
+                "monetary values in MILLIONS of USD. No conversion needed."
+            )
+        # Unknown override keyword — fall through to autodetect.
+
+    compact = re.sub(r"\s+", "", text).lower()
+    thousands_hits = sum(len(re.findall(p, compact)) for p in _THOUSANDS_MARKERS)
+    millions_hits  = sum(len(re.findall(p, compact)) for p in _MILLIONS_MARKERS)
+
+    if thousands_hits > millions_hits:
+        return (
+            f"NOTE: This filing reports monetary values in THOUSANDS of USD "
+            f"(detected {thousands_hits} 'thousands' unit declarations vs "
+            f"{millions_hits} 'millions'). Divide all monetary values from "
+            f"tables by 1000 to convert to millions before returning. "
+            f"IMPORTANT: ignore inline MD&A prose like '$1,055 million' — "
+            f"use the TABLE headers as ground truth since the tables are "
+            f"where the extracted values come from."
+        )
+    if millions_hits > thousands_hits:
+        return (
+            f"NOTE: This filing reports monetary values in MILLIONS of USD "
+            f"(detected {millions_hits} 'millions' unit declarations vs "
+            f"{thousands_hits} 'thousands'). No conversion needed."
+        )
+    return (
+        f"NOTE: Reporting unit ambiguous — found {thousands_hits} 'thousands' "
+        f"and {millions_hits} 'millions' declarations. Look for '(in thousands)' "
+        f"or '(in millions)' adjacent to each financial table you read and "
+        f"scale accordingly. Convert all monetary values to millions of USD."
+    )
+
+
+def extract_text_from_pdf(path: Path) -> str:
+    """
+    Extract text from a PDF using pdfplumber. Page breaks are preserved
+    as `\\n\\n--- PAGE N ---\\n\\n` markers so Claude can see structure
+    when reasoning about multi-page tables. Canadian issuers file
+    quarterly MD&A and interim financials as PDFs on SEDAR+, so this is
+    the entry point for any non-mining Canadian filing.
+    """
+    pieces: list[str] = []
+    with pdfplumber.open(path) as pdf:
+        for i, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            pieces.append(f"\n\n--- PAGE {i} ---\n\n{text}")
+    return "".join(pieces)
+
+
+def find_financial_section_flexible(text: str) -> str:
+    """
+    Locate financial statements in a document that may use either
+    US 10-K headings or Canadian IFRS MD&A / interim report headings.
+    Falls back to the existing SEC-focused finder, then to the tail 60%
+    of the text when no markers match at all.
+    """
+    text_upper = text.upper()
+    # Start searching ~15% in so we skip cover/TOC without being too
+    # aggressive — Canadian quarterlies are shorter than 10-Ks.
+    search_start = int(len(text) * 0.15)
+
+    markers = [
+        # US 10-K / 10-Q headings
+        "CONSOLIDATED STATEMENTS OF OPERATIONS",
+        "CONSOLIDATED STATEMENTS OF INCOME",
+        "CONSOLIDATED BALANCE SHEET",
+        "CONSOLIDATED STATEMENTS OF COMPREHENSIVE INCOME",
+        "CONSOLIDATED STATEMENTS OF CASH FLOW",
+        # Canadian IFRS headings
+        "INTERIM CONDENSED CONSOLIDATED STATEMENTS OF INCOME",
+        "INTERIM CONSOLIDATED STATEMENTS OF INCOME",
+        "CONDENSED INTERIM CONSOLIDATED STATEMENTS OF INCOME",
+        "INTERIM CONSOLIDATED STATEMENTS OF COMPREHENSIVE INCOME",
+        "INTERIM CONSOLIDATED BALANCE SHEET",
+        "INTERIM CONSOLIDATED STATEMENTS OF CASH FLOW",
+        "STATEMENTS OF FINANCIAL POSITION",
+        # Either-or
+        "MANAGEMENT'S DISCUSSION AND ANALYSIS",
+        "MANAGEMENTS DISCUSSION AND ANALYSIS",
+    ]
+
+    best_pos = len(text)
+    for marker in markers:
+        pos = text_upper.find(marker, search_start)
+        if 0 < pos < best_pos:
+            best_pos = pos
+
+    if best_pos >= len(text):
+        return text[int(len(text) * 0.40):]
+
+    return text[best_pos: best_pos + 120_000]
+
+
+def extract_metrics_from_pdf(
+    filing_path: Path,
+    period: str,
+    reporting_units: str | None = None,
+) -> dict[str, Any]:
+    """
+    Full pipeline for PDF-based financial filings (Canadian quarterly
+    reports, annual reports, MD&A, or any uploaded non-mining PDF):
+    PDF -> text -> financial section -> chunks -> Claude -> merged metrics.
+
+    Uses the same `SYSTEM_PROMPT` as the HTM pipeline, so the 12
+    standard financial metrics are extracted with identical semantics.
+
+    `reporting_units` is an optional CLI-supplied override ('thousands' or
+    'millions') that bypasses autodetection. The escape hatch matters
+    because Canadian IFRS interim reports sometimes use unit phrases
+    (e.g. "all amounts rounded to the nearest thousand") that the
+    detector's regex library doesn't yet cover.
+    """
+    filing_path = Path(filing_path)
+    print(f"  Extracting text from {filing_path.name}...")
+    full_text = extract_text_from_pdf(filing_path)
+    print(f"  Full text length: {len(full_text):,} chars")
+
+    # Strip the page-break scaffolding ("--- PAGE N ---") before deciding
+    # whether the PDF actually yielded any content — an image-only PDF
+    # still produces those markers even though there's no real text.
+    real_text = re.sub(r"--- PAGE \d+ ---", "", full_text).strip()
+    if not real_text:
+        print("  WARNING: PDF yielded no text — likely a scanned image. Skipping.")
+        return {m: None for m in METRICS_TO_EXTRACT}
+
+    financial_section = find_financial_section_flexible(full_text)
+    print(f"  Financial section: {len(financial_section):,} chars")
+
+    # Scan the FULL document when autodetecting units because Canadian IFRS
+    # reports declare '(thousands of United States dollars)' in the repeated
+    # table headers, many of which live well past the 120k-char financial
+    # section slice.
+    unit_hint = detect_reporting_unit(full_text, override=reporting_units)
+    print(f"  Units: {unit_hint[:80]}...")
+
+    chunks = chunk_text(financial_section)
+    print(f"  Sending {len(chunks)} chunk(s) to Claude...")
+
+    results: list[dict[str, Any]] = []
+    for i, chunk in enumerate(chunks):
+        print(f"    Chunk {i + 1}/{len(chunks)}...", end=" ", flush=True)
+        try:
+            annotated_chunk = f"{unit_hint}\n\n{chunk}"
+            metrics = extract_metrics_from_chunk(annotated_chunk)
+            results.append(metrics)
+            merged_so_far = merge_metrics(results)
+            found = sum(1 for v in merged_so_far.values() if v is not None)
+            print(f"{found}/{len(METRICS_TO_EXTRACT)} metrics found")
+            if found == len(METRICS_TO_EXTRACT):
+                break
+        except Exception as e:
+            print(f"ERROR: {e}")
+            results.append({})
+
+    return merge_metrics(results)
+
+
+def extract_metrics(
+    filing_path: Path,
+    period: str,
+    reporting_units: str | None = None,
+) -> dict[str, Any]:
     """
     Full pipeline: HTM file -> text -> chunks -> Claude -> merged metrics.
+
+    `reporting_units` optionally overrides the autodetected unit scale. See
+    `extract_metrics_from_pdf` for rationale.
     """
     print(f"  Extracting text from {filing_path.name}...")
     full_text = extract_text_from_htm(filing_path)
@@ -222,9 +432,10 @@ def extract_metrics(filing_path: Path, period: str) -> dict[str, Any]:
     financial_section = find_financial_section(full_text)
     print(f"  Financial section: {len(financial_section):,} chars")
 
-    # Detect reporting unit and prepend hint to every chunk
-    unit_hint = detect_reporting_unit(financial_section)
-    print(f"  Units: {unit_hint[:60]}...")
+    # Autodetect on the full document so unit declarations buried in 10-K
+    # footnotes still register, then allow CLI override.
+    unit_hint = detect_reporting_unit(full_text, override=reporting_units)
+    print(f"  Units: {unit_hint[:80]}...")
 
     chunks = chunk_text(financial_section)
     print(f"  Sending {len(chunks)} chunk(s) to Claude...")
