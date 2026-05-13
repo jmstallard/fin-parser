@@ -62,6 +62,11 @@ FAKE_SUBMISSIONS = {
                                 "0000320193-22-000108", "0000320193-23-000050"],
             "filingDate":      ["2023-11-03", "2023-08-04", "2022-10-28", "2023-06-01"],
             "reportDate":      ["2023-09-30", "2023-07-01", "2022-09-24", ""],
+            # get_filings now zips primaryDocument into each result. Without
+            # it, zip() stops at the shortest iterable ([]) and yields zero
+            # rows, which is what was causing the IndexError on filings[0].
+            "primaryDocument": ["aapl-20230930.htm", "aapl-20230701.htm",
+                                "aapl-20220924.htm", "aapl-8k-20230601.htm"],
         }
     }
 }

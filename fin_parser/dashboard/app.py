@@ -152,10 +152,22 @@ def load_red_flags(filing_id: int) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def _valuations_columns() -> set[str]:
+    """Discover which columns the valuations table has. Lets the dashboard
+    keep working against pre-migration DBs that don't yet have
+    outputs_json (the column that carries the WACC/DCF/IRR/sensitivity
+    payload)."""
+    conn = get_db()
+    return {row["name"] for row in conn.execute("PRAGMA table_info(valuations)").fetchall()}
+
+
 def load_valuations(filing_id: int) -> list[dict]:
     conn = get_db()
+    cols = _valuations_columns()
+    outputs_expr = "outputs_json" if "outputs_json" in cols else "NULL AS outputs_json"
     rows = conn.execute(
-        "SELECT method, result, inputs_json FROM valuations WHERE filing_id = ? ORDER BY computed_at DESC",
+        f"SELECT method, result, inputs_json, {outputs_expr} "
+        f"FROM valuations WHERE filing_id = ? ORDER BY computed_at DESC",
         (filing_id,)
     ).fetchall()
     return [dict(r) for r in rows]
@@ -543,30 +555,142 @@ for idx, (metric, label) in enumerate(CHART_METRICS):
 
 # ── Valuation ──────────────────────────────────────────────────────────────
 st.markdown("## Valuations")
+
+
+def _parse_outputs(v: dict) -> dict | None:
+    """Return the parsed outputs_json blob for a valuation row, or None
+    for pre-migration rows that only have the bare intrinsic-value number."""
+    raw = v.get("outputs_json")
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except Exception:
+        return None
+
+
+def _short_label(data: dict) -> str:
+    short = (data["company"] or "").split()[0] or data["company"]
+    label = f"{short} · {data['form_type']}"
+    if data.get("project"):
+        label += f" · {data['project']}"
+    return label
+
+
 val_cols = st.columns(len(selected))
 for i, (lbl, data) in enumerate(filing_data.items()):
     with val_cols[i]:
-        # Short company name + form type so same-issuer columns don't
-        # look identical (e.g. 'Agnico · 10-Q' vs 'Agnico · NI 43-101').
-        short = (data["company"] or "").split()[0] or data["company"]
-        header = f"{short} · {data['form_type']}"
-        if data.get("project"):
-            header += f" · {data['project']}"
-        st.markdown(f"#### {header}")
-        if data["valuations"]:
-            v = data["valuations"][0]
-            st.metric("Intrinsic Value/Share", f"${v['result']:,.2f}")
-            if v.get("inputs_json"):
-                try:
-                    inputs = json.loads(v["inputs_json"])
-                    dcf = inputs.get("dcf_inputs", {})
-                    wacc_in = inputs.get("wacc_inputs", {})
-                    st.caption(f"WACC: {wacc_in.get('risk_free_rate', 0) + wacc_in.get('beta', 1) * wacc_in.get('equity_risk_premium', 0.055):.1%} · "
-                               f"Growth: {dcf.get('growth_rate_stage1', 0):.0%} → {dcf.get('terminal_growth_rate', 0):.1%}")
-                except Exception:
-                    pass
-        else:
+        st.markdown(f"#### {_short_label(data)}")
+        if not data["valuations"]:
             st.caption("No valuation — run `fin-parser value TICKER --market-cap N`")
+            continue
+
+        v = data["valuations"][0]
+        out = _parse_outputs(v)
+
+        # Headline number — always available, even on old rows.
+        intrinsic = out["intrinsic_value_per_share"] if out else v["result"]
+        st.metric("Intrinsic Value/Share", f"${intrinsic:,.2f}")
+
+        if not out:
+            # Pre-migration row: nothing else to render. Nudge a re-run so
+            # the next snapshot carries the full breakdown.
+            st.caption("Re-run `fin-parser value` to see WACC / DCF breakdown.")
+            continue
+
+        # WACC breakdown — tabular text.
+        st.markdown("**WACC**")
+        wacc_rows = [
+            ("Cost of equity",   f"{out['cost_of_equity']:.2%}"),
+            ("Cost of debt (AT)", f"{out['cost_of_debt']:.2%}"),
+            ("Equity weight",    f"{out['equity_weight']:.2%}"),
+            ("Debt weight",      f"{out['debt_weight']:.2%}"),
+            ("WACC",             f"{out['wacc']:.2%}"),
+        ]
+        st.dataframe(
+            pd.DataFrame(wacc_rows, columns=["", "Value"]).set_index(""),
+            use_container_width=True,
+        )
+
+        # DCF + multiples — tabular text.
+        st.markdown("**DCF & multiples**")
+        dcf_rows = [
+            ("PV of FCFs ($M)",       f"${out['pv_of_fcfs']:,.0f}"),
+            ("Terminal value ($M)",   f"${out['terminal_value']:,.0f}"),
+            ("Enterprise value ($M)", f"${out['enterprise_value']:,.0f}"),
+        ]
+        if out.get("irr") is not None:
+            dcf_rows.append(("IRR", f"{out['irr']:.2%}"))
+        if out.get("pe_ratio") is not None:
+            dcf_rows.append(("P/E", f"{out['pe_ratio']:.1f}x"))
+        if out.get("ev_ebitda") is not None:
+            dcf_rows.append(("EV / EBITDA", f"{out['ev_ebitda']:.1f}x"))
+        st.dataframe(
+            pd.DataFrame(dcf_rows, columns=["", "Value"]).set_index(""),
+            use_container_width=True,
+        )
+
+
+# Sensitivity heatmaps — rendered below the per-company columns so each
+# table has the full page width to itself. Stage-1 growth on the y-axis,
+# WACC on the x-axis, intrinsic value per share in the cells.
+sens_companies = [
+    (lbl, data, _parse_outputs(data["valuations"][0]))
+    for lbl, data in filing_data.items()
+    if data["valuations"] and _parse_outputs(data["valuations"][0])
+    and _parse_outputs(data["valuations"][0]).get("sensitivity")
+]
+if sens_companies:
+    st.markdown("### Sensitivity — Intrinsic Value/Share")
+    st.caption("Rows: Stage-1 growth · Columns: WACC. NaN cells = WACC ≤ terminal growth.")
+
+    sens_cols = st.columns(min(2, len(sens_companies)))
+    for idx, (lbl, data, out) in enumerate(sens_companies):
+        sens = out["sensitivity"]  # {growth_str: {wacc_str: value_or_None}}
+        growth_keys = sorted(float(g) for g in sens.keys())
+        wacc_keys = sorted({float(w) for row in sens.values() for w in row.keys()})
+
+        z = []
+        text = []
+        for g in growth_keys:
+            row_vals = []
+            row_text = []
+            for w in wacc_keys:
+                cell = sens[str(g)].get(str(w))
+                if cell is None:
+                    row_vals.append(None)
+                    row_text.append("—")
+                else:
+                    row_vals.append(cell)
+                    row_text.append(f"${cell:,.0f}")
+            z.append(row_vals)
+            text.append(row_text)
+
+        fig = go.Figure(data=go.Heatmap(
+            z=z,
+            x=[f"{w:.1%}" for w in wacc_keys],
+            y=[f"{g:.1%}" for g in growth_keys],
+            text=text,
+            texttemplate="%{text}",
+            colorscale="Viridis",
+            hoverongaps=False,
+            hovertemplate="WACC %{x} · Growth %{y}<br>$%{z:,.0f}/share<extra></extra>",
+            colorbar=dict(title="$/share"),
+        ))
+        fig.update_layout(
+            title=_short_label(data),
+            xaxis_title="WACC",
+            yaxis_title="Stage-1 growth",
+            paper_bgcolor="#0f1419",
+            plot_bgcolor="#0a0e14",
+            font=dict(color="#cdd9e5", family="IBM Plex Mono"),
+            title_font=dict(color="#58a6ff"),
+            margin=dict(t=50, b=40, l=60, r=20),
+            height=340,
+        )
+
+        with sens_cols[idx % len(sens_cols)]:
+            st.plotly_chart(fig, use_container_width=True)
 
 # ── Red flags ──────────────────────────────────────────────────────────────
 st.markdown("## Red Flag Analysis")

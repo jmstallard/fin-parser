@@ -1,0 +1,26 @@
+#fin-parser upload-ca --ticker AEM --company "Agnico Eagle Mines Limited" \
+#  --form "Interim Financial Statements" --period 2025-09-30 \
+#  --pdf ./data/Q3-2025-quarterly-report.pdf \
+#  --reporting-units thousands
+
+#fin-parser upload-ca --ticker AEM --company "Agnico Eagle Mines Limited" \
+#    --form "NI 43-101" --period 2025-03-31 \
+#    --pdf data/NI-43-101-Technical-Report-Canadian-Malartic-Mine.pdf
+#fin-parser redflag AEM
+echo fin-parser upload-ca --ticker AEM --company "Agnico Eagle Mines Limited" \
+  --form "NI 43-101" --period YYYY-MM-DD \
+  --pdf ../data/N1-43-101-Detour-Lake-Mine.pdf
+  --project "Detour Lake"
+
+fin-parser upload-ca --ticker AEM --company "Agnico Eagle Mines Limited" \
+  --form "NI 43-101" --period YYYY-MM-DD \
+  --pdf ../data/N1-43-101-Detour-Lake-Mine.pdf
+  --project "Detour Lake"
+
+streamlit run fin-parser/dashboard/app.py
+
+
+
+
+
+

@@ -80,12 +80,14 @@ CREATE TABLE IF NOT EXISTS red_flags (
 
 -- Phase 2: valuation snapshots
 CREATE TABLE IF NOT EXISTS valuations (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    filing_id   INTEGER NOT NULL REFERENCES filings(id) ON DELETE CASCADE,
-    method      TEXT    NOT NULL,   -- 'dcf', 'wacc', 'irr'
-    result      REAL,
-    inputs_json TEXT,               -- JSON blob of inputs used
-    computed_at TEXT    NOT NULL DEFAULT (datetime('now'))
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    filing_id    INTEGER NOT NULL REFERENCES filings(id) ON DELETE CASCADE,
+    method       TEXT    NOT NULL,   -- 'dcf', 'wacc', 'irr'
+    result       REAL,               -- headline number (intrinsic value/share)
+    inputs_json  TEXT,                -- JSON blob of inputs used
+    outputs_json TEXT,                -- JSON blob of computed outputs
+                                      -- (WACC components, EV, PV, IRR, P/E, sensitivity)
+    computed_at  TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 """
 
@@ -136,6 +138,15 @@ def _apply_migrations(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_filings_jurisdiction ON filings(jurisdiction)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_filings_source       ON filings(source)")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_filings_project      ON filings(project)")
+
+    # valuations.outputs_json — stores the full ValuationResult (WACC
+    # components, DCF figures, IRR, P/E, sensitivity table) so the
+    # dashboard can render them without re-running the engine. Older
+    # rows leave it NULL and the dashboard falls back to the bare
+    # intrinsic-value-per-share number.
+    val_cols = {row["name"] for row in conn.execute("PRAGMA table_info(valuations)").fetchall()}
+    if "outputs_json" not in val_cols:
+        conn.execute("ALTER TABLE valuations ADD COLUMN outputs_json TEXT")
 
 
 def init_db(db_path: Path = DB_PATH) -> None:

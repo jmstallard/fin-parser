@@ -82,7 +82,12 @@ def cmd_extract(args: argparse.Namespace) -> None:
 def cmd_value(args: argparse.Namespace) -> None:
     from fin_parser.ingestion.repository import get_filing_by_accession, get_metrics
     from fin_parser.valuation.engine import DCFInputs, WACCInputs, run_valuation
-    from fin_parser.db import get_connection
+    from fin_parser.db import get_connection, init_db
+
+    # Make sure the outputs_json column exists on pre-existing DBs so the
+    # snapshot write below doesn't fail on databases created before the
+    # column was added.
+    init_db()
 
     # Load most recent filing metrics from DB
     row = _get_latest_filing_for_ticker(args.ticker)
@@ -162,14 +167,51 @@ def cmd_value(args: argparse.Namespace) -> None:
         )
         print(f"{g:>8.1%} | {vals}")
 
-    # Save to DB
+    # Save to DB. We persist the full ValuationResult (WACC components,
+    # DCF figures, IRR, P/E, sensitivity table) so the dashboard can
+    # render the same breakdown the CLI just printed.
     from fin_parser.db import transaction
     import json as _json
+    import math as _math
+
+    def _nan_to_none(v):
+        return None if (isinstance(v, float) and _math.isnan(v)) else v
+
+    sensitivity_safe = {
+        # JSON dict keys must be strings; the dashboard converts back to
+        # float on read. NaN cells (when WACC <= terminal growth) become
+        # None so the JSON stays standards-compliant.
+        str(g): {str(w): _nan_to_none(v) for w, v in row.items()}
+        for g, row in result.sensitivity.items()
+    }
+
+    outputs_payload = {
+        "wacc":                       result.wacc,
+        "cost_of_equity":             result.cost_of_equity,
+        "cost_of_debt":               result.cost_of_debt,
+        "equity_weight":              result.equity_weight,
+        "debt_weight":                result.debt_weight,
+        "intrinsic_value_per_share":  result.intrinsic_value_per_share,
+        "enterprise_value":           result.enterprise_value,
+        "terminal_value":             result.terminal_value,
+        "pv_of_fcfs":                 result.pv_of_fcfs,
+        "irr":                        result.irr,
+        "pe_ratio":                   result.pe_ratio,
+        "ev_ebitda":                  result.ev_ebitda,
+        "sensitivity":                sensitivity_safe,
+    }
+
     with transaction() as conn:
         conn.execute(
-            "INSERT INTO valuations (filing_id, method, result, inputs_json) VALUES (?, ?, ?, ?)",
-            (filing_id, "dcf_wacc", result.intrinsic_value_per_share,
-             _json.dumps(result.inputs_summary)),
+            "INSERT INTO valuations (filing_id, method, result, inputs_json, outputs_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                filing_id,
+                "dcf_wacc",
+                result.intrinsic_value_per_share,
+                _json.dumps(result.inputs_summary),
+                _json.dumps(outputs_payload),
+            ),
         )
     print(f"\nValuation saved to DB.")
 
